@@ -1,0 +1,79 @@
+name: Auto-moderate Staticman comment PRs
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  moderate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Act on Copilot's review verdict
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            const prNumber = pr.number;
+            const reviewer = context.payload.review.user.login;
+
+            // Only act on Copilot. The display handle is @Copilot; underlying
+            // login can vary across the rollout. Match permissively.
+            const isCopilot = /^copilot(\b|-|\[)/i.test(reviewer);
+            if (!isCopilot) {
+              core.info(`Ignoring review from ${reviewer}`);
+              return;
+            }
+
+            // Gather every body Copilot has written on this PR: the review
+            // body itself, all inline review comments, and any PR-level
+            // (issue) comments. Copilot leaves verdicts as inline comments.
+            const parts = [context.payload.review.body || ''];
+
+            const inline = await github.paginate(
+              github.rest.pulls.listReviewComments,
+              { owner, repo, pull_number: prNumber, per_page: 100 }
+            );
+            for (const c of inline) {
+              if (/^copilot(\b|-|\[)/i.test(c.user.login)) parts.push(c.body || '');
+            }
+
+            const issueComments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number: prNumber, per_page: 100 }
+            );
+            for (const c of issueComments) {
+              if (/^copilot(\b|-|\[)/i.test(c.user.login)) parts.push(c.body || '');
+            }
+
+            const text = parts.join('\n').toLowerCase();
+            const isSpam = /\bspam\b/.test(text);
+            core.info(`PR #${prNumber}: isSpam=${isSpam}`);
+
+            if (isSpam) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber,
+                body: 'Auto-closing: Copilot flagged this submission as spam.',
+              });
+              await github.rest.pulls.update({
+                owner, repo, pull_number: prNumber, state: 'closed',
+              });
+              try {
+                if (pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`) {
+                  await github.rest.git.deleteRef({
+                    owner, repo, ref: `heads/${pr.head.ref}`,
+                  });
+                }
+              } catch (e) {
+                core.warning(`Branch delete failed: ${e.message}`);
+              }
+              return;
+            }
+
+            await github.rest.pulls.merge({
+              owner, repo, pull_number: prNumber, merge_method: 'merge',
+            });
