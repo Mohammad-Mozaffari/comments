@@ -56,7 +56,7 @@ jobs:
             // of appearing in a legitimate comment.
             const SPAM_RE = new RegExp([
               // Slot/casino game titles
-              'fortune\\s*(tiger|ox|rabbit|mouse|dragon)',
+              'fortune\\s*(tiger|ox|rabbit|mouse|dragon|gods?)',
               'wild\\s*bandito',
               'wild\\s*wild\\s*riches',
               'lucky\\s*neko',
@@ -69,10 +69,18 @@ jobs:
               'leprechaun\\s*riches',
               'gem\\s*saviour',
               'dragon\\s*hatch',
+              'dim\\s*sum\\s*prize',
+              'sweet\\s*bonanza',
+              'gates\\s*of\\s*olympus',
+              'sugar\\s*rush',
+              'crazy\\s*time',
+              '\\baviator\\b',
+              '\\bplinko\\b',
               'tigrinho',
               'jogo\\s*do\\s*tigrinho',
               'pg\\s*(soft|slot)',
               'slot\\s*(demo|gratis|grátis|machine)',
+              'slots?\\s+eleg[ií]veis',
               'bombom',
               'ninja\\s*vs\\s*samurai',
               // Casino / gambling vocabulary
@@ -115,6 +123,27 @@ jobs:
               '\\bsession\\s+(roi|hit)',
               'stop\\s*(gain|loss)',
               'turbo\\s+mode',
+              'taxa\\s+de\\s+hit',
+              'fechei\\s+em\\s+r\\$',
+              'galera\\s+(dos?\\s+dados|mais\\s+antiga)',
+              'compra\\s+de\\s+b[oô]nus',
+              // Brazilian-real money amounts in messages are a strong gambling signal
+              // on an English-language ML blog.
+              'r\\$\\s*\\d+',
+              // Sports-betting vocabulary
+              'world\\s+cup',
+              '\\bqualifiers\\b',
+              'consolation\\s+goals?',
+              'late\\s+strikes?',
+              // Chinese TV-piracy / streaming spam
+              'aiyifan',
+              '高清完整版',
+              '美剧',
+              '海外华人',
+              '第.\\s*季',
+              // Generic link-bait author names
+              '\\bcomparativos?\\b',
+              '\\buptodown\\b',
               'और\\s*देखें',  // "see more" (Hindi link-bait)
               'अधिक\\s*देखें',
             ].join('|'), 'i');
