@@ -1,8 +1,36 @@
 name: Auto-moderate Staticman comment PRs
 
+# Strategy:
+#  - On PR open: run a content heuristic on the added comment YAML.
+#      * heuristic says spam → close immediately.
+#      * heuristic says clean → leave open, wait for Copilot.
+#  - On Copilot review/comment (any type): re-evaluate everything.
+#      * heuristic says spam OR Copilot text says "spam" → close.
+#      * otherwise → merge (clean + Copilot has weighed in).
+#  - Hourly schedule: safety net for PRs Copilot never reviews.
+#      Older than MIN_AGE_FOR_MERGE_MINUTES with no spam signal → merge.
+#
+# This means we don't trust Copilot for the primary spam verdict (it has
+# proven unreliable — it often just describes the PR without classifying).
+# The diff-content heuristic is the workhorse; Copilot is a backup.
+
 on:
+  pull_request:
+    types: [opened, reopened, synchronize]
   pull_request_review:
     types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+  issue_comment:
+    types: [created]
+  schedule:
+    - cron: '17 * * * *'  # hourly safety net
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'If true, only log decisions; do not merge/close.'
+        required: false
+        default: 'false'
 
 permissions:
   contents: write
@@ -12,68 +40,202 @@ jobs:
   moderate:
     runs-on: ubuntu-latest
     steps:
-      - name: Act on Copilot's review verdict
+      - name: Evaluate PR(s) and act
         uses: actions/github-script@v7
+        env:
+          MIN_AGE_FOR_MERGE_MINUTES: '60'
         with:
           script: |
             const { owner, repo } = context.repo;
-            const pr = context.payload.pull_request;
-            const prNumber = pr.number;
-            const reviewer = context.payload.review.user.login;
+            const dryRun = (context.payload.inputs?.dry_run === 'true');
+            const MIN_AGE_MIN = Number(process.env.MIN_AGE_FOR_MERGE_MINUTES || 60);
 
-            // Only act on Copilot. The display handle is @Copilot; underlying
-            // login can vary across the rollout. Match permissively.
-            const isCopilot = /^copilot(\b|-|\[)/i.test(reviewer);
-            if (!isCopilot) {
-              core.info(`Ignoring review from ${reviewer}`);
-              return;
-            }
+            // ---- Heuristic spam regex. Tuned to the spam this repo actually
+            // receives (Portuguese/Spanish/etc. gambling+casino content). The
+            // blog is about ML/LLM compression — these terms have ~zero chance
+            // of appearing in a legitimate comment.
+            const SPAM_RE = new RegExp([
+              // Slot/casino game titles
+              'fortune\\s*(tiger|ox|rabbit|mouse|dragon)',
+              'wild\\s*bandito',
+              'wild\\s*wild\\s*riches',
+              'lucky\\s*neko',
+              'mahjong\\s*ways',
+              'ganesha\\s*gold',
+              'jewel\\s*race',
+              'pinata\\s*wins',
+              'buffalo\\s*win',
+              'piggy\\s*gold',
+              'leprechaun\\s*riches',
+              'gem\\s*saviour',
+              'dragon\\s*hatch',
+              'tigrinho',
+              'jogo\\s*do\\s*tigrinho',
+              'pg\\s*(soft|slot)',
+              'slot\\s*(demo|gratis|grátis|machine)',
+              'bombom',
+              'ninja\\s*vs\\s*samurai',
+              // Casino / gambling vocabulary
+              'cas[si]nos?',
+              'roleta',
+              'usdt',
+              'giros\\s*gr[áa]tis',
+              'b[oô]nus',
+              // Spammy author-name / link-bait patterns
+              'trustguru',
+              'betano',
+              'view\\s*details',
+              'ver\\s*detalles',
+              'm[áa]s\\s*informaci[óo]n',
+              'clique\\s*aqui',
+              'click\\s*here',
+              '\\bkunjungi\\b',
+              'i-click\\s*dito',
+              'redaç[ãa]o\\s*TrustGuru',
+              'redacci[óo]n\\s*TrustGuru',
+              'redaksi\\s*TrustGuru',
+              'editoryal\\s*ng\\s*TrustGuru',
+              'melhores\\s*cassinos',
+              'app\\s*jogos',
+              'online\\s*casino',
+              'jogo-do-tigrinho',
+              'melhores-cassinos',
+              'casino\\s*plus\\s*pagcor',
+              '888-?casino',
+              '888\\s*bet',
+              '\\ba5game\\b',
+              'pinata-wins',
+              'fortune-tiger',
+              'buffalo-win',
+              'desativar-modo-desenvolvedor',
+              // Gambling-community jargon that catches the subtler spam
+              'pre-session',
+              'discord\\s+groups',
+              '\\bhit-?rate\\b',
+              '\\bsession\\s+(roi|hit)',
+              'stop\\s*(gain|loss)',
+              'turbo\\s+mode',
+              'और\\s*देखें',  // "see more" (Hindi link-bait)
+              'अधिक\\s*देखें',
+            ].join('|'), 'i');
 
-            // Gather every body Copilot has written on this PR: the review
-            // body itself, all inline review comments, and any PR-level
-            // (issue) comments. Copilot leaves verdicts as inline comments.
-            const parts = [context.payload.review.body || ''];
+            const isCopilot = (login) => /^copilot(\b|-|\[)/i.test(login || '');
 
-            const inline = await github.paginate(
-              github.rest.pulls.listReviewComments,
-              { owner, repo, pull_number: prNumber, per_page: 100 }
-            );
-            for (const c of inline) {
-              if (/^copilot(\b|-|\[)/i.test(c.user.login)) parts.push(c.body || '');
-            }
-
-            const issueComments = await github.paginate(
-              github.rest.issues.listComments,
-              { owner, repo, issue_number: prNumber, per_page: 100 }
-            );
-            for (const c of issueComments) {
-              if (/^copilot(\b|-|\[)/i.test(c.user.login)) parts.push(c.body || '');
-            }
-
-            const text = parts.join('\n').toLowerCase();
-            const isSpam = /\bspam\b/.test(text);
-            core.info(`PR #${prNumber}: isSpam=${isSpam}`);
-
-            if (isSpam) {
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: prNumber,
-                body: 'Auto-closing: Copilot flagged this submission as spam.',
-              });
-              await github.rest.pulls.update({
-                owner, repo, pull_number: prNumber, state: 'closed',
-              });
-              try {
-                if (pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`) {
-                  await github.rest.git.deleteRef({
-                    owner, repo, ref: `heads/${pr.head.ref}`,
-                  });
+            async function fetchAddedCommentText(prNumber) {
+              const files = await github.paginate(
+                github.rest.pulls.listFiles,
+                { owner, repo, pull_number: prNumber, per_page: 100 }
+              );
+              const lines = [];
+              for (const f of files) {
+                if (!/^_data\/comments\/.*\.ya?ml$/.test(f.filename)) continue;
+                const patch = f.patch || '';
+                for (const l of patch.split('\n')) {
+                  if (l.startsWith('+') && !l.startsWith('+++')) lines.push(l.slice(1));
                 }
-              } catch (e) {
-                core.warning(`Branch delete failed: ${e.message}`);
               }
-              return;
+              return lines.join('\n');
             }
 
-            await github.rest.pulls.merge({
-              owner, repo, pull_number: prNumber, merge_method: 'merge',
-            });
+            async function fetchCopilotText(prNumber) {
+              const parts = [];
+              const reviews = await github.paginate(
+                github.rest.pulls.listReviews,
+                { owner, repo, pull_number: prNumber, per_page: 100 }
+              );
+              for (const r of reviews) if (isCopilot(r.user?.login)) parts.push(r.body || '');
+              const inline = await github.paginate(
+                github.rest.pulls.listReviewComments,
+                { owner, repo, pull_number: prNumber, per_page: 100 }
+              );
+              for (const c of inline) if (isCopilot(c.user?.login)) parts.push(c.body || '');
+              const issueComments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: prNumber, per_page: 100 }
+              );
+              for (const c of issueComments) if (isCopilot(c.user?.login)) parts.push(c.body || '');
+              return { text: parts.join('\n'), hasReview: reviews.some(r => isCopilot(r.user?.login)) };
+            }
+
+            async function evaluate(prNumber, opts = {}) {
+              const { allowMergeWithoutCopilot = false } = opts;
+              const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+              if (pr.state !== 'open') {
+                core.info(`PR #${prNumber}: not open, skipping.`);
+                return;
+              }
+
+              const added = await fetchAddedCommentText(prNumber);
+              if (!added) {
+                core.info(`PR #${prNumber}: no _data/comments YAML changes, skipping.`);
+                return;
+              }
+              const heuristicSpam = SPAM_RE.test(added);
+
+              const { text: copilotText, hasReview: copilotReviewed } = await fetchCopilotText(prNumber);
+              const copilotSpam = /\bspam\b/i.test(copilotText);
+
+              const isSpam = heuristicSpam || copilotSpam;
+              core.info(`PR #${prNumber}: heuristicSpam=${heuristicSpam} copilotSpam=${copilotSpam} copilotReviewed=${copilotReviewed}`);
+
+              if (dryRun) return;
+
+              if (isSpam) {
+                const reason = heuristicSpam
+                  ? 'Auto-closing: comment content matched spam heuristic.'
+                  : 'Auto-closing: Copilot flagged this submission as spam.';
+                await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body: reason });
+                await github.rest.pulls.update({ owner, repo, pull_number: prNumber, state: 'closed' });
+                if (pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`) {
+                  await github.rest.git.deleteRef({ owner, repo, ref: `heads/${pr.head.ref}` })
+                    .catch((e) => core.warning(`Branch delete failed: ${e.message}`));
+                }
+                return;
+              }
+
+              // Clean. Merge only once Copilot has had a chance to review,
+              // unless the caller explicitly allows merging without that
+              // (e.g., the hourly safety net for stale PRs).
+              if (!copilotReviewed && !allowMergeWithoutCopilot) {
+                core.info(`PR #${prNumber}: clean but waiting for Copilot review.`);
+                return;
+              }
+
+              await github.rest.pulls.merge({
+                owner, repo, pull_number: prNumber, merge_method: 'merge',
+              }).catch((e) => core.warning(`Merge failed for #${prNumber}: ${e.message}`));
+            }
+
+            // Decide which PRs to process based on the triggering event.
+            const event = context.eventName;
+            let targets = [];
+
+            if (event === 'pull_request') {
+              targets.push({ num: context.payload.pull_request.number });
+            } else if (event === 'pull_request_review' || event === 'pull_request_review_comment') {
+              targets.push({ num: context.payload.pull_request.number });
+            } else if (event === 'issue_comment') {
+              if (context.payload.issue.pull_request) {
+                targets.push({ num: context.payload.issue.number });
+              }
+            } else if (event === 'schedule' || event === 'workflow_dispatch') {
+              const open = await github.paginate(github.rest.pulls.list, {
+                owner, repo, state: 'open', per_page: 100,
+              });
+              const cutoff = Date.now() - MIN_AGE_MIN * 60 * 1000;
+              targets = open.map((p) => ({
+                num: p.number,
+                // Stale PRs (older than MIN_AGE_MIN with no Copilot review)
+                // are allowed to merge without waiting for Copilot.
+                allowMergeWithoutCopilot: new Date(p.created_at).getTime() < cutoff,
+              }));
+            }
+
+            core.info(`Event=${event}, evaluating ${targets.length} PR(s). dryRun=${dryRun}`);
+            for (const t of targets) {
+              try {
+                await evaluate(t.num, { allowMergeWithoutCopilot: !!t.allowMergeWithoutCopilot });
+              } catch (e) {
+                core.warning(`PR #${t.num}: ${e.message}`);
+              }
+            }
