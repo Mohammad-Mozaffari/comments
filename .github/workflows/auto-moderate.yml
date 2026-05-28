@@ -44,11 +44,17 @@ jobs:
         uses: actions/github-script@v7
         env:
           MIN_AGE_FOR_MERGE_MINUTES: '60'
+          AKISMET_API_KEY: ${{ secrets.AKISMET_API_KEY }}
+          AKISMET_BLOG_URL: 'https://www.cs.toronto.edu/~mmozaffari/'
+          AKISMET_USER_AGENT: 'mmozaffari-blog-comments/1.0 | Akismet-Action'
         with:
           script: |
             const { owner, repo } = context.repo;
             const dryRun = (context.payload.inputs?.dry_run === 'true');
             const MIN_AGE_MIN = Number(process.env.MIN_AGE_FOR_MERGE_MINUTES || 60);
+            const AKISMET_KEY = process.env.AKISMET_API_KEY || '';
+            const AKISMET_BLOG = process.env.AKISMET_BLOG_URL || '';
+            const AKISMET_UA = process.env.AKISMET_USER_AGENT || 'akismet-action/1.0';
 
             // ---- Heuristic spam regex. Tuned to the spam this repo actually
             // receives (Portuguese/Spanish/etc. gambling+casino content). The
@@ -76,6 +82,10 @@ jobs:
               'crazy\\s*time',
               '\\baviator\\b',
               '\\bplinko\\b',
+              'emperor.?s\\s*favou?r',
+              'big\\s*bass',
+              '\\bspaceman\\b',
+              '\\bjetx\\b',
               'tigrinho',
               'jogo\\s*do\\s*tigrinho',
               'pg\\s*(soft|slot)',
@@ -96,6 +106,7 @@ jobs:
               'ver\\s*detalles',
               'm[áa]s\\s*informaci[óo]n',
               'clique\\s*aqui',
+              'confira\\s*aqui',
               'click\\s*here',
               '\\bkunjungi\\b',
               'i-click\\s*dito',
@@ -144,26 +155,103 @@ jobs:
               // Generic link-bait author names
               '\\bcomparativos?\\b',
               '\\buptodown\\b',
+              '\\bx\\d+games?\\b',
+              'gest[ãa]o\\s+de\\s+banca',
               'और\\s*देखें',  // "see more" (Hindi link-bait)
               'अधिक\\s*देखें',
             ].join('|'), 'i');
 
             const isCopilot = (login) => /^copilot(\b|-|\[)/i.test(login || '');
 
-            async function fetchAddedCommentText(prNumber) {
+            async function fetchAddedComments(prNumber) {
+              // Returns { rawAdded, comments: [{ slug, name, message }] }
               const files = await github.paginate(
                 github.rest.pulls.listFiles,
                 { owner, repo, pull_number: prNumber, per_page: 100 }
               );
-              const lines = [];
+              const rawAddedParts = [];
+              const comments = [];
               for (const f of files) {
-                if (!/^_data\/comments\/.*\.ya?ml$/.test(f.filename)) continue;
+                const m = f.filename.match(/^_data\/comments\/([^/]+)\/.*\.ya?ml$/);
+                if (!m) continue;
+                const slug = m[1];
                 const patch = f.patch || '';
-                for (const l of patch.split('\n')) {
-                  if (l.startsWith('+') && !l.startsWith('+++')) lines.push(l.slice(1));
-                }
+                const added = patch.split('\n')
+                  .filter((l) => l.startsWith('+') && !l.startsWith('+++'))
+                  .map((l) => l.slice(1))
+                  .join('\n');
+                rawAddedParts.push(added);
+                const parsed = parseStaticmanYaml(added);
+                comments.push({ slug, name: parsed.name || '', message: parsed.message || '' });
               }
-              return lines.join('\n');
+              return { rawAdded: rawAddedParts.join('\n'), comments };
+            }
+
+            // Minimal YAML parser tuned to Staticman's output. Handles
+            // scalar values, quoted strings, and `>-` / `|` block scalars.
+            function parseStaticmanYaml(text) {
+              const out = {};
+              const lines = text.split('\n');
+              let i = 0;
+              while (i < lines.length) {
+                const m = lines[i].match(/^([A-Za-z_][\w]*):\s*(.*)$/);
+                if (!m) { i++; continue; }
+                const key = m[1];
+                let val = m[2].trim();
+                if (val.startsWith('>') || val.startsWith('|')) {
+                  i++;
+                  const acc = [];
+                  while (i < lines.length && (/^\s{2,}/.test(lines[i]) || lines[i].trim() === '')) {
+                    acc.push(lines[i].trim());
+                    i++;
+                  }
+                  out[key] = acc.join(' ').trim();
+                  continue;
+                }
+                if ((val.startsWith("'") && val.endsWith("'")) ||
+                    (val.startsWith('"') && val.endsWith('"'))) {
+                  val = val.slice(1, -1);
+                }
+                out[key] = val;
+                i++;
+              }
+              return out;
+            }
+
+            async function akismetSaysSpam(name, message, slug) {
+              if (!AKISMET_KEY || !AKISMET_BLOG) return null; // not configured
+              const params = new URLSearchParams({
+                api_key: AKISMET_KEY,
+                blog: AKISMET_BLOG,
+                user_ip: '127.0.0.1',
+                user_agent: 'staticman-comment-submission',
+                referrer: AKISMET_BLOG,
+                comment_type: 'comment',
+                comment_author: name,
+                comment_content: message,
+                blog_lang: 'en',
+                blog_charset: 'UTF-8',
+              });
+              if (slug) params.set('permalink', AKISMET_BLOG.replace(/\/?$/, '/') + slug + '/');
+              const url = `https://${AKISMET_KEY}.rest.akismet.com/1.1/comment-check`;
+              try {
+                const r = await fetch(url, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'User-Agent': AKISMET_UA,
+                  },
+                  body: params.toString(),
+                });
+                const body = (await r.text()).trim();
+                if (body === 'true') return true;
+                if (body === 'false') return false;
+                core.warning(`Akismet returned unexpected body: "${body}" (status ${r.status})`);
+                return null;
+              } catch (e) {
+                core.warning(`Akismet call failed: ${e.message}`);
+                return null;
+              }
             }
 
             async function fetchCopilotText(prNumber) {
@@ -194,25 +282,36 @@ jobs:
                 return;
               }
 
-              const added = await fetchAddedCommentText(prNumber);
-              if (!added) {
+              const { rawAdded, comments } = await fetchAddedComments(prNumber);
+              if (!rawAdded) {
                 core.info(`PR #${prNumber}: no _data/comments YAML changes, skipping.`);
                 return;
               }
-              const heuristicSpam = SPAM_RE.test(added);
+              const heuristicSpam = SPAM_RE.test(rawAdded);
 
               const { text: copilotText, hasReview: copilotReviewed } = await fetchCopilotText(prNumber);
               const copilotSpam = /\bspam\b/i.test(copilotText);
 
-              const isSpam = heuristicSpam || copilotSpam;
-              core.info(`PR #${prNumber}: heuristicSpam=${heuristicSpam} copilotSpam=${copilotSpam} copilotReviewed=${copilotReviewed}`);
+              // Stage 2: ask Akismet only if the cheap regex check didn't already flag it.
+              let akismetSpam = false;
+              if (!heuristicSpam && AKISMET_KEY) {
+                for (const c of comments) {
+                  const v = await akismetSaysSpam(c.name, c.message, c.slug);
+                  if (v === true) { akismetSpam = true; break; }
+                }
+              }
+
+              const isSpam = heuristicSpam || copilotSpam || akismetSpam;
+              core.info(`PR #${prNumber}: heuristicSpam=${heuristicSpam} akismetSpam=${akismetSpam} copilotSpam=${copilotSpam} copilotReviewed=${copilotReviewed}`);
 
               if (dryRun) return;
 
               if (isSpam) {
                 const reason = heuristicSpam
                   ? 'Auto-closing: comment content matched spam heuristic.'
-                  : 'Auto-closing: Copilot flagged this submission as spam.';
+                  : (akismetSpam
+                    ? 'Auto-closing: Akismet classified this submission as spam.'
+                    : 'Auto-closing: Copilot flagged this submission as spam.');
                 await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body: reason });
                 await github.rest.pulls.update({ owner, repo, pull_number: prNumber, state: 'closed' });
                 if (pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`) {
