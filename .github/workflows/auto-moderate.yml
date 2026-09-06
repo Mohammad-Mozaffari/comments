@@ -6,13 +6,21 @@ name: Auto-moderate Staticman comment PRs
 #      * heuristic says clean → leave open, wait for Copilot.
 #  - On Copilot review/comment (any type): re-evaluate everything.
 #      * heuristic says spam OR Copilot text says "spam" → close.
-#      * otherwise → merge (clean + Copilot has weighed in).
+#      * otherwise → merge (clean + Copilot actually reviewed).
 #  - Hourly schedule: safety net for PRs Copilot never reviews.
-#      Older than MIN_AGE_FOR_MERGE_MINUTES with no spam signal → merge.
+#      Older than MIN_AGE_FOR_MERGE_MINUTES → merge only with an explicit
+#      Akismet "not spam" verdict; otherwise flag for manual moderation.
 #
 # This means we don't trust Copilot for the primary spam verdict (it has
 # proven unreliable — it often just describes the PR without classifying).
 # The diff-content heuristic is the workhorse; Copilot is a backup.
+#
+# Auto-merge requires a POSITIVE clean signal, never merely the absence of a
+# spam one. In 2026-06/07 Copilot ran out of quota and answered every PR with
+# a review-shaped stub ("unable to review ... quota limit"); the old gate
+# counted that as "Copilot has weighed in" and merged eight spam comments
+# within ~10s of submission. Such stubs no longer count as a review, and a PR
+# with no real signal is now held for a human instead of merged.
 
 on:
   pull_request:
@@ -159,9 +167,72 @@ jobs:
               'gest[ãa]o\\s+de\\s+banca',
               'और\\s*देखें',  // "see more" (Hindi link-bait)
               'अधिक\\s*देखें',
+              // --- 2026-06/07 wave: softer gambling / fantasy-sports spam that
+              // slipped past every pattern above (PRs #313 #319 #341 #344 #346
+              // #375 #383 #406). Kept narrow enough not to fire on ML prose.
+              'jogo\\s*d[oe]\\s*tigr\\w*',
+              '\\btigrinho?\\b',
+              '\\btigre\\b',
+              'tiger\\s*(demo|slot|bet)',
+              'treasures?\\s*of\\s*aztec',
+              // Betting operators / brands
+              '\\bbetway\\b',
+              '\\bbet\\s*365\\b',
+              '\\b1xbet\\b',
+              '\\bbetfair\\b',
+              'blaze\\s*(strategy|bet|double|crash|apostas?)',
+              'luck\\s*bet',
+              // Indonesian / Malay gambling vocabulary
+              'judi\\s*(online|bola|slot)',
+              'piala\\s*dunia',
+              'jadwal\\s*(piala|bola|slot)',
+              '\\bwordwall\\b',
+              // Portuguese betting vocabulary
+              'free\\s*bets?',
+              '\\bapostas?\\b',
+              '\\bapostar\\b',
+              'odds\\s*ao\\s*vivo',
+              'melhores\\s*slots?',
+              'slots?\\s*(gr[áa]tis|online|pagando|20\\d\\d)',
+              '\\bmilz[ãa]o\\b',
+              'controle\\s*emocional',
+              // Fantasy cricket / rummy link-bait
+              '\\brummy\\b',
+              'vice-?captain',
+              'dream\\s*11\\b',
+              'fantasy\\s*(cricket|team|league|xi|11)',
+              'playing\\s*(xi|11)\\b',
+              'icc\\s*(playing|world|t20|odi)',
+              '\\bt20\\s*(world\\s*cup|league|blast|match)',
+              '\\bipl\\s*20\\d\\d\\b',
             ].join('|'), 'i');
 
             const isCopilot = (login) => /^copilot(\b|-|\[)/i.test(login || '');
+
+            // Copilot posts a review-shaped placeholder when it cannot actually
+            // review the PR — most often because the requesting user is out of
+            // quota. That is not a review, and must not satisfy the merge gate.
+            const COPILOT_NO_REVIEW_RE =
+              /(unable to review|couldn'?t review|can ?not review|quota limit|rate limit)/i;
+
+            const MANUAL_MARKER = '<!-- auto-moderate:needs-manual-review -->';
+
+            async function flagForManualReview(prNumber, why) {
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number: prNumber, labels: ['needs-manual-review'],
+              }).catch((e) => core.warning(`Label failed for #${prNumber}: ${e.message}`));
+              const existing = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: prNumber, per_page: 100 }
+              );
+              if (existing.some((c) => (c.body || '').includes(MANUAL_MARKER))) return;
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber,
+                body: `${MANUAL_MARKER}\nHeld for manual moderation: ${why}, and no `
+                  + `independent clean signal was available, so this PR will not be `
+                  + `auto-merged. Please check the comment content and merge or close it.`,
+              }).catch((e) => core.warning(`Comment failed for #${prNumber}: ${e.message}`));
+            }
 
             async function fetchAddedComments(prNumber) {
               // Returns { rawAdded, comments: [{ slug, name, message }] }
@@ -271,7 +342,15 @@ jobs:
                 { owner, repo, issue_number: prNumber, per_page: 100 }
               );
               for (const c of issueComments) if (isCopilot(c.user?.login)) parts.push(c.body || '');
-              return { text: parts.join('\n'), hasReview: reviews.some(r => isCopilot(r.user?.login)) };
+              const copilotReviews = reviews.filter((r) => isCopilot(r.user?.login));
+              const realReviews = copilotReviews.filter(
+                (r) => (r.body || '').trim() && !COPILOT_NO_REVIEW_RE.test(r.body)
+              );
+              return {
+                text: parts.join('\n'),
+                hasRealReview: realReviews.length > 0,
+                stubbed: copilotReviews.length > 0 && realReviews.length === 0,
+              };
             }
 
             async function evaluate(prNumber, opts = {}) {
@@ -289,20 +368,30 @@ jobs:
               }
               const heuristicSpam = SPAM_RE.test(rawAdded);
 
-              const { text: copilotText, hasReview: copilotReviewed } = await fetchCopilotText(prNumber);
-              const copilotSpam = /\bspam\b/i.test(copilotText);
+              const { text: copilotText, hasRealReview: copilotReviewed, stubbed: copilotStubbed } =
+                await fetchCopilotText(prNumber);
+              // Don't let a review that says "this is not spam" trip the check.
+              const copilotSpam = /\bspam\b/i.test(copilotText)
+                && !/\b(not|isn'?t|no)\s+spam\b/i.test(copilotText);
 
-              // Stage 2: ask Akismet only if the cheap regex check didn't already flag it.
-              let akismetSpam = false;
-              if (!heuristicSpam && AKISMET_KEY) {
+              // Stage 2: ask Akismet only if the cheap regex check didn't already
+              // flag it. akismetVerdict is true = spam, false = confirmed clean,
+              // null = no answer (key missing, network error, odd response body).
+              // Only an explicit `false` counts as a positive clean signal below.
+              let akismetVerdict = null;
+              if (!AKISMET_KEY) {
+                core.warning('AKISMET_API_KEY is not set — Akismet stage skipped.');
+              } else if (!heuristicSpam) {
                 for (const c of comments) {
                   const v = await akismetSaysSpam(c.name, c.message, c.slug);
-                  if (v === true) { akismetSpam = true; break; }
+                  if (v === true) { akismetVerdict = true; break; }
+                  if (v === false && akismetVerdict === null) akismetVerdict = false;
                 }
               }
+              const akismetSpam = akismetVerdict === true;
 
               const isSpam = heuristicSpam || copilotSpam || akismetSpam;
-              core.info(`PR #${prNumber}: heuristicSpam=${heuristicSpam} akismetSpam=${akismetSpam} copilotSpam=${copilotSpam} copilotReviewed=${copilotReviewed}`);
+              core.info(`PR #${prNumber}: heuristicSpam=${heuristicSpam} akismetVerdict=${akismetVerdict} copilotSpam=${copilotSpam} copilotReviewed=${copilotReviewed} copilotStubbed=${copilotStubbed}`);
 
               if (dryRun) return;
 
@@ -321,11 +410,20 @@ jobs:
                 return;
               }
 
-              // Clean. Merge only once Copilot has had a chance to review,
-              // unless the caller explicitly allows merging without that
-              // (e.g., the hourly safety net for stale PRs).
-              if (!copilotReviewed && !allowMergeWithoutCopilot) {
-                core.info(`PR #${prNumber}: clean but waiting for Copilot review.`);
+              // Clean so far. Auto-merge needs a POSITIVE clean signal, never
+              // just the absence of a spam one:
+              //   * a real Copilot review that did not call it spam, or
+              //   * (stale PRs only) an explicit Akismet "not spam" verdict.
+              // A Copilot stub ("unable to review ... quota limit") is not a
+              // review. With no signal at all the PR is held for a human.
+              const positiveClean =
+                copilotReviewed || (allowMergeWithoutCopilot && akismetVerdict === false);
+              if (!positiveClean) {
+                const why = copilotStubbed
+                  ? 'Copilot could not review this PR (quota exhausted or unavailable)'
+                  : 'no Copilot review yet';
+                core.info(`PR #${prNumber}: heuristics clean but ${why} — not auto-merging.`);
+                if (allowMergeWithoutCopilot) await flagForManualReview(prNumber, why);
                 return;
               }
 
